@@ -20,11 +20,13 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
-
+      # Build first: @mo/server and @mo/ui typecheck against the compiled dist of
+      # @mo/shared and @mo/tracing, so the libs must exist before typecheck runs.
       - name: Build
         run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
 
       - name: Install Playwright browser
         run: pnpm --filter @mo/e2e exec playwright install --with-deps chromium
