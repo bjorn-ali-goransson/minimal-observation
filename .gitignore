@@ -11,3 +11,7 @@ playwright-report/
 test-results/
 .pnpm-store/
 coverage/
+
+# Go server
+go-server/moserver
+go-server/data/
