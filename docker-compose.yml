@@ -1,0 +1,60 @@
+# Full local stack: the APM server + a MinIO that mocks S3 for the cold tier.
+# `docker compose up` gives you a feather-light APM at http://localhost:4318 with a
+# real S3-backed cold tier — no cloud account needed. E2E: `pnpm e2e` (host) or the
+# `e2e` profile below.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  # Creates the bucket once MinIO is healthy, then exits.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/mo-spans &&
+      echo 'bucket ready';
+      "
+
+  server:
+    build: .
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      MO_API_KEY: dev-secret-key
+      MO_PORT: "4318"
+      MO_DATA_DIR: /data
+      MO_RETENTION_DAYS: "7"
+      MO_COLD_KIND: s3
+      MO_S3_ENDPOINT: http://minio:9000
+      MO_S3_BUCKET: mo-spans
+      MO_S3_ACCESS_KEY: minioadmin
+      MO_S3_SECRET_KEY: minioadmin
+      MO_S3_URL_STYLE: path
+      # Optional: enable the AI investigator by passing your key through.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MO_AGENT_MODEL: ${MO_AGENT_MODEL:-claude-opus-4-8}
+    ports:
+      - "4318:4318"
+    volumes:
+      - mo-data:/data
+
+volumes:
+  mo-data:

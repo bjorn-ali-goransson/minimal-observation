@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+playwright-report/
+test-results/
+.pnpm-store/
+coverage/
