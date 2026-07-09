@@ -12,7 +12,7 @@ export interface Config {
   flushMaxRows: number;
   flushMaxMs: number;
   cold: { kind: 'local' | 's3'; idleMs: number; s3: S3Config };
-  agent: { apiKey: string | undefined; model: string };
+  agent: { apiKey: string | undefined; model: string; baseUrl: string | undefined };
 }
 
 export interface S3Config {
@@ -46,5 +46,7 @@ export const config: Config = {
   agent: {
     apiKey: env.ANTHROPIC_API_KEY || undefined,
     model: env.MO_AGENT_MODEL || 'claude-opus-4-8',
+    // Override the Anthropic API base URL — used by e2e to point at a local mock.
+    baseUrl: env.ANTHROPIC_BASE_URL || env.MO_AGENT_BASE_URL || undefined,
   },
 };

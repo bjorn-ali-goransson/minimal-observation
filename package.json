@@ -15,6 +15,6 @@
     "seed": "pnpm --filter @mo/server seed",
     "sample": "pnpm --filter @mo/sample start",
     "typecheck": "pnpm -r typecheck",
-    "e2e": "pnpm --filter @mo/e2e test"
+    "e2e": "pnpm build && pnpm --filter @mo/e2e test"
   }
 }

@@ -43,7 +43,10 @@ Tiering rationale (see the design in git history / README):
 - `packages/ui` — `@mo/ui`: React + Vite + uPlot. Tiny hash router. Views: Services, Service, Endpoint,
   Trace (waterfall), Dependencies, Dependency, Query (custom SQL + chart), Agent.
 - `services/sample` — `@mo/sample`: a real instrumented Express app (gateway→backend) that emits traces.
-- `e2e` — Playwright. `smoke.spec.ts` (UI) + `cold.spec.ts` (freeze/S3, gated by `MO_TEST_COLD=1`).
+- `e2e` — Playwright, **hermetic**: no external services. The config boots the app (local cold tier)
+  and a **mock Anthropic** server (`mocks/anthropic.mjs`); the agent's `baseURL` is pointed at it so the
+  real tool loop runs offline. `smoke.spec.ts` (UI), `agent.spec.ts` (mocked LLM), `cold.spec.ts`
+  (freeze; gated by `MO_TEST_COLD=1`). Set `MO_BASE_URL` to test an external stack (compose + MinIO-as-S3).
 
 ## Commands
 
@@ -57,7 +60,8 @@ pnpm start             # run compiled server (node packages/server/dist/index.js
 pnpm seed              # POST ~400 synthetic OTLP traces to the running server
 pnpm sample            # run the instrumented Express sample (real OTel spans)
 pnpm typecheck         # tsc across the workspace
-pnpm e2e               # Playwright against a running server (MO_BASE_URL, default :4318)
+pnpm e2e               # build, then hermetic Playwright run (boots app + mock Anthropic, no network)
+                       # against an external stack instead:  MO_BASE_URL=… pnpm --filter @mo/e2e test
 docker compose up      # full stack incl. MinIO-as-S3 cold tier
 ```
 

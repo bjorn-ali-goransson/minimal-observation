@@ -84,7 +84,7 @@ export interface AgentStep {
 
 export async function investigate(store: DuckStore, question: string, maxSteps = 12): Promise<{ answer: string; steps: AgentStep[] }> {
   if (!config.agent.apiKey) throw new Error('agent disabled: set ANTHROPIC_API_KEY');
-  const client = new Anthropic({ apiKey: config.agent.apiKey });
+  const client = new Anthropic({ apiKey: config.agent.apiKey, baseURL: config.agent.baseUrl });
   const steps: AgentStep[] = [];
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: question }];
 

@@ -5,7 +5,20 @@ const KEY = process.env.MO_API_KEY || 'dev-secret-key';
 const hex = (seed: number, n: number) =>
   Array.from({ length: n }, (_, i) => (((seed * 9301 + 49297 * (i + 1)) % 233280) % 16).toString(16)).join('');
 
+async function waitForServer() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      if ((await fetch(`${BASE}/api/health`)).ok) return;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`server at ${BASE} did not become healthy`);
+}
+
 export default async function globalSetup() {
+  await waitForServer();
   const now = Date.now();
   const spans: any[] = [];
   const push = (service: string, s: any) => spans.push({ service, ...s });
