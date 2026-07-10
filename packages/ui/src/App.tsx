@@ -9,6 +9,7 @@ import { Dependencies } from './pages/Dependencies.js';
 import { Dependency } from './pages/Dependency.js';
 import { Query } from './pages/Query.js';
 import { Agent } from './pages/Agent.js';
+import { ColdBadge } from './components/ColdBadge.js';
 
 interface Meta {
   currentDay: string;
@@ -93,6 +94,7 @@ export function App() {
             ))}
           </div>
           <button onClick={() => setTick((t) => t + 1)}>↻ Refresh</button>
+          <ColdBadge />
           <div className="spacer" />
           <button
             onClick={() => {

@@ -94,6 +94,10 @@ func (s *Server) routes() http.Handler {
 			"coldKind": s.cfg.ColdKind, "agentEnabled": s.cfg.AgentEnabled, "impl": "go-sqlite",
 		})
 	})
+	// Cold-tier status: which frozen days exist and which are currently loaded (attached).
+	mux.HandleFunc("GET /api/frozen", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, s.store.frozenStatus())
+	})
 
 	mux.HandleFunc("GET /api/services", func(w http.ResponseWriter, r *http.Request) {
 		from, to, window := rng(r)
@@ -164,6 +168,7 @@ func (s *Server) routes() http.Handler {
 		if window > 0 {
 			tp = toF(summary["n"]) / (float64(window) / 60000.0)
 		}
+		s.coldHeader(w, from, to)
 		writeJSON(w, 200, map[string]any{
 			"service": service, "name": name,
 			"summary":          summary,
@@ -187,6 +192,7 @@ func (s *Server) routes() http.Handler {
 			writeJSON(w, 500, map[string]any{"error": err.Error()})
 			return
 		}
+		s.coldHeader(w, from, to)
 		writeJSON(w, 200, emptyIfNil(rows))
 	})
 
@@ -203,6 +209,9 @@ func (s *Server) routes() http.Handler {
 					sp["attrs"] = m
 				}
 			}
+		}
+		if dayHint > 0 {
+			s.coldHeader(w, dayHint-86400000, dayHint+86400000)
 		}
 		writeJSON(w, 200, map[string]any{"spans": emptyIfNil(spans)})
 	})
@@ -294,6 +303,7 @@ func (s *Server) routes() http.Handler {
 			w.Write([]byte(toCSV(rows)))
 			return
 		}
+		s.coldHeader(w, from, to)
 		writeJSON(w, 200, map[string]any{"count": len(rows), "spans": rows})
 	})
 
@@ -386,6 +396,14 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// coldHeader tells the browser a response drew on frozen (cold/S3) data, and which days.
+func (s *Server) coldHeader(w http.ResponseWriter, from, to int64) {
+	if days := s.store.coldDaysInRange(from, to); len(days) > 0 {
+		w.Header().Set("X-MO-Cold", strings.Join(days, ","))
+		w.Header().Set("access-control-expose-headers", "X-MO-Cold")
+	}
 }
 
 func toF(v any) float64 {

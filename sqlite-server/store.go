@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,12 @@ type Store struct {
 
 	rmu     sync.Mutex
 	rollups map[rollupKey]*rollupAgg
+
+	frozen     FrozenStore
+	fmu        sync.Mutex
+	frozenDays map[string]bool
+	attached   map[string]int64 // day -> lastAccess unix ms (attached frozen SQLite files)
+	loading    map[string]bool  // day -> a fetch (possibly from S3) is in flight
 }
 
 type rollupKey struct {
@@ -100,12 +107,86 @@ func newStore(cfg Config) (*Store, error) {
 	if _, err := db.Exec(createSQL); err != nil {
 		return nil, err
 	}
-	s := &Store{cfg: cfg, db: db, currentDay: today(), rollups: map[rollupKey]*rollupAgg{}}
-	if err := s.rebuildRollups(); err != nil {
+	s := &Store{cfg: cfg, db: db, currentDay: today(), rollups: map[rollupKey]*rollupAgg{},
+		frozenDays: map[string]bool{}, attached: map[string]int64{}, loading: map[string]bool{}}
+	if s.frozen, err = newFrozenStore(cfg); err != nil {
+		return nil, err
+	}
+	if err := s.rebuildRollups(); err != nil { // hot (unfrozen) rollups from the live table
+		return nil, err
+	}
+	if err := s.loadFrozenRollups(); err != nil { // frozen-day rollups from their snapshots
 		return nil, err
 	}
 	go s.loops()
 	return s, nil
+}
+
+func attachSchema(day string) string { return "f_" + strings.ReplaceAll(day, "-", "_") }
+
+// dayBoundsNs returns [start, end) epoch-nanoseconds for a local calendar day.
+func dayBoundsNs(day string) (int64, int64) {
+	t, err := time.ParseInLocation("2006-01-02", day, time.Local)
+	if err != nil {
+		return 0, 0
+	}
+	start := t.UnixMilli()
+	end := t.AddDate(0, 0, 1).UnixMilli()
+	return start * 1e6, end * 1e6
+}
+
+// loadFrozenRollups pulls each frozen day's small rollup snapshot into the in-memory map,
+// so overviews work across restarts without touching the big frozen span files.
+func (s *Store) loadFrozenRollups() error {
+	days, err := s.frozen.ListDays()
+	if err != nil {
+		return err
+	}
+	s.fmu.Lock()
+	for _, d := range days {
+		s.frozenDays[d] = true
+	}
+	s.fmu.Unlock()
+	for _, d := range days {
+		data, err := s.frozen.GetRollups(d)
+		if err != nil {
+			continue
+		}
+		var rows []frozenRollup
+		if json.Unmarshal(data, &rows) != nil {
+			continue
+		}
+		s.rmu.Lock()
+		for _, r := range rows {
+			k := rollupKey{Hour: r.Hour, Service: r.Service, Name: r.Name, SpanType: r.SpanType, Dependency: r.Dependency, IsTx: r.IsTx}
+			a := s.rollups[k]
+			if a == nil {
+				a = &rollupAgg{Hist: make([]int, bucketCount)}
+				s.rollups[k] = a
+			}
+			a.N += r.N
+			a.Errors += r.Errors
+			a.SumDurNs += r.SumDurNs
+			for i := 0; i < bucketCount && i < len(r.Hist); i++ {
+				a.Hist[i] += r.Hist[i]
+			}
+		}
+		s.rmu.Unlock()
+	}
+	return nil
+}
+
+type frozenRollup struct {
+	Hour       int64   `json:"h"`
+	Service    string  `json:"s"`
+	Name       string  `json:"n"`
+	SpanType   string  `json:"t"`
+	Dependency string  `json:"d"`
+	IsTx       bool    `json:"x"`
+	N          int64   `json:"c"`
+	Errors     int64   `json:"e"`
+	SumDurNs   float64 `json:"m"`
+	Hist       []int   `json:"b"`
 }
 
 func (s *Store) loops() {
@@ -265,6 +346,89 @@ func (s *Store) getRollups(fromMs, toMs int64, service, name string) ([]RollupRo
 	return out, nil
 }
 
+// ---- raw source (hot + attached frozen days) ----
+
+// rawSource returns a relation covering [fromMs,toMs]: the hot `spans` table UNION each frozen
+// day in range (attached from its per-day SQLite file, downloaded from S3 on first touch).
+// Frozen rows were deleted from hot on freeze, so there is no double counting.
+func (s *Store) rawSource(fromMs, toMs int64) string {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	parts := []string{"SELECT * FROM main.spans"}
+	for _, day := range daysBetween(fromMs, toMs, s.cfg.RetentionDays+2) {
+		if s.frozenDays[day] && s.ensureAttachedLocked(day) {
+			parts = append(parts, "SELECT * FROM "+attachSchema(day)+".spans")
+		}
+	}
+	if len(parts) == 1 {
+		return "spans"
+	}
+	return "(" + strings.Join(parts, " UNION ALL ") + ")"
+}
+
+// frozenStatus reports the cold tier state for the UI (which days are frozen / currently loaded).
+func (s *Store) frozenStatus() map[string]any {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	days := make([]map[string]any, 0, len(s.frozenDays))
+	for day := range s.frozenDays {
+		last, loaded := s.attached[day]
+		days = append(days, map[string]any{"day": day, "loaded": loaded, "loadingNow": s.loading[day], "lastAccessMs": last})
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i]["day"].(string) > days[j]["day"].(string) })
+	loadingNow := false
+	for _, v := range s.loading {
+		loadingNow = loadingNow || v
+	}
+	return map[string]any{"coldKind": s.cfg.ColdKind, "retentionDays": s.cfg.RetentionDays, "idleMs": s.cfg.ColdIdleMs, "loadingNow": loadingNow, "days": days}
+}
+
+// coldDaysInRange lists frozen days intersecting [fromMs,toMs] — so a handler can tell the UI
+// (via a response header) that a request read from cold/S3 storage.
+func (s *Store) coldDaysInRange(fromMs, toMs int64) []string {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	var out []string
+	for _, day := range daysBetween(fromMs, toMs, s.cfg.RetentionDays+2) {
+		if s.frozenDays[day] {
+			out = append(out, day)
+		}
+	}
+	return out
+}
+
+func (s *Store) ensureAttachedLocked(day string) bool {
+	if _, ok := s.attached[day]; ok {
+		s.attached[day] = time.Now().UnixMilli()
+		return true
+	}
+	s.loading[day] = true // reflected in /api/frozen while the (possibly S3) fetch is in flight
+	defer delete(s.loading, day)
+	path, err := s.frozen.EnsureLocal(day)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "frozen ensure-local:", day, err)
+		return false
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("ATTACH DATABASE %s AS %s", q(path), attachSchema(day))); err != nil {
+		fmt.Fprintln(os.Stderr, "frozen attach:", day, err)
+		return false
+	}
+	s.attached[day] = time.Now().UnixMilli()
+	return true
+}
+
+func daysBetween(fromMs, toMs int64, maxDays int) []string {
+	var days []string
+	cur := time.UnixMilli(fromMs)
+	cur = time.Date(cur.Year(), cur.Month(), cur.Day(), 0, 0, 0, 0, time.Local)
+	end := time.UnixMilli(toMs)
+	for !cur.After(end) && len(days) < maxDays {
+		days = append(days, cur.Format("2006-01-02"))
+		cur = cur.AddDate(0, 0, 1)
+	}
+	return days
+}
+
 // ---- raw queries ----
 
 func (s *Store) queryAll(query string, args ...any) ([]map[string]any, error) {
@@ -322,20 +486,26 @@ func (s *Store) getTraceList(fromMs, toMs int64, service, name, status string, m
 		limit = 100
 	}
 	return s.queryAll(fmt.Sprintf(`SELECT trace_id, span_id, service, name, http_method, http_status, status,
-		start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms FROM spans WHERE %s ORDER BY start_ns DESC LIMIT %d`,
-		strings.Join(w, " AND "), limit))
+		start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms FROM %s WHERE %s ORDER BY start_ns DESC LIMIT %d`,
+		s.rawSource(fromMs, toMs), strings.Join(w, " AND "), limit))
 }
 
 func (s *Store) getTrace(traceID string, dayHintMs int64) ([]map[string]any, error) {
-	return s.queryAll(`SELECT trace_id, span_id, parent_id, service, name, kind, span_type, dependency,
+	from, to := dayHintMs-dayMs, dayHintMs+dayMs
+	if dayHintMs == 0 {
+		to = time.Now().UnixMilli()
+		from = to - int64(s.cfg.RetentionDays)*dayMs
+	}
+	return s.queryAll(fmt.Sprintf(`SELECT trace_id, span_id, parent_id, service, name, kind, span_type, dependency,
 		is_transaction, status, status_message, http_method, http_status, db_system, db_statement, db_rows,
-		start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms, attrs FROM spans WHERE trace_id=? ORDER BY start_ns`, traceID)
+		start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms, attrs FROM %s WHERE trace_id=%s ORDER BY start_ns`,
+		s.rawSource(from, to), q(traceID)))
 }
 
 func (s *Store) getDependencyTraces(dep string, fromMs, toMs int64, limit int) ([]map[string]any, error) {
 	return s.queryAll(fmt.Sprintf(`SELECT trace_id, span_id, service, name, dependency, span_type, status,
-		db_statement, db_rows, start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms FROM spans
-		WHERE dependency=%s AND start_ns >= %d ORDER BY start_ns DESC LIMIT %d`, q(dep), fromMs*1e6, limit))
+		db_statement, db_rows, start_ns/1e6 AS start_ms, dur_ns/1e6 AS dur_ms FROM %s
+		WHERE dependency=%s AND start_ns >= %d ORDER BY start_ns DESC LIMIT %d`, s.rawSource(fromMs, toMs), q(dep), fromMs*1e6, limit))
 }
 
 func contQuantile(sorted []float64, qq float64) float64 {
@@ -357,9 +527,9 @@ func contQuantile(sorted []float64, qq float64) float64 {
 
 // getEndpointSummary computes EXACT percentiles in Go (SQLite has no quantile_cont).
 func (s *Store) getEndpointSummary(service, name string, fromMs, toMs int64) (map[string]any, error) {
-	rows, err := s.db.Query(fmt.Sprintf(`SELECT dur_ns, status FROM spans
+	rows, err := s.db.Query(fmt.Sprintf(`SELECT dur_ns, status FROM %s
 		WHERE is_transaction=1 AND service=%s AND name=%s AND %s ORDER BY dur_ns LIMIT 200000`,
-		q(service), q(name), timeWhere(fromMs, toMs)))
+		s.rawSource(fromMs, toMs), q(service), q(name), timeWhere(fromMs, toMs)))
 	if err != nil {
 		return map[string]any{}, err
 	}
@@ -392,18 +562,20 @@ func (s *Store) getEndpointSummary(service, name string, fromMs, toMs int64) (ma
 }
 
 func (s *Store) getEndpointBreakdown(service, name string, fromMs, toMs int64) ([]map[string]any, error) {
-	return s.queryAll(fmt.Sprintf(`WITH txn AS (SELECT DISTINCT trace_id FROM spans
+	src := s.rawSource(fromMs, toMs)
+	return s.queryAll(fmt.Sprintf(`WITH src AS (SELECT * FROM %s), txn AS (SELECT DISTINCT trace_id FROM src
 		WHERE is_transaction=1 AND service=%s AND name=%s AND %s LIMIT 300)
-		SELECT span_type, count(*) AS n, sum(dur_ns)/1e6 AS ms FROM spans
+		SELECT span_type, count(*) AS n, sum(dur_ns)/1e6 AS ms FROM src
 		WHERE trace_id IN (SELECT trace_id FROM txn) GROUP BY span_type ORDER BY ms DESC`,
-		q(service), q(name), timeWhere(fromMs, toMs)))
+		src, q(service), q(name), timeWhere(fromMs, toMs)))
 }
 
 func (s *Store) getDependencyEndpoints(dep string, fromMs, toMs int64) ([]map[string]any, error) {
-	return s.queryAll(fmt.Sprintf(`WITH d AS (SELECT DISTINCT trace_id FROM spans WHERE dependency=%s AND %s LIMIT 500)
-		SELECT service, name, count(*) AS n, avg(dur_ns)/1e6 AS avg_ms FROM spans
+	src := s.rawSource(fromMs, toMs)
+	return s.queryAll(fmt.Sprintf(`WITH src AS (SELECT * FROM %s), d AS (SELECT DISTINCT trace_id FROM src WHERE dependency=%s AND %s LIMIT 500)
+		SELECT service, name, count(*) AS n, avg(dur_ns)/1e6 AS avg_ms FROM src
 		WHERE is_transaction=1 AND trace_id IN (SELECT trace_id FROM d)
-		GROUP BY service, name ORDER BY n DESC LIMIT 20`, q(dep), timeWhere(fromMs, toMs)))
+		GROUP BY service, name ORDER BY n DESC LIMIT 20`, src, q(dep), timeWhere(fromMs, toMs)))
 }
 
 func (s *Store) exportSpans(fromMs, toMs int64, service, name, dep, status string, minDur float64, limit int) ([]map[string]any, error) {
@@ -428,7 +600,7 @@ func (s *Store) exportSpans(fromMs, toMs int64, service, name, dep, status strin
 	}
 	return s.queryAll(fmt.Sprintf(`SELECT trace_id, span_id, parent_id, service, name, kind, span_type, dependency,
 		status, db_statement, db_rows, http_method, http_status, round(dur_ns/1e6,3) AS dur_ms, start_ns/1e6 AS start_ms
-		FROM spans WHERE %s ORDER BY start_ns DESC LIMIT %d`, strings.Join(w, " AND "), limit))
+		FROM %s WHERE %s ORDER BY start_ns DESC LIMIT %d`, s.rawSource(fromMs, toMs), strings.Join(w, " AND "), limit))
 }
 
 var deniedRe = regexp.MustCompile(`(?i)\b(insert|update|delete|drop|create|alter|attach|copy|install|load|pragma|export|import|call|vacuum|reindex)\b`)
@@ -446,7 +618,13 @@ func (s *Store) runReadOnlySQL(query string) (map[string]any, error) {
 	if regexp.MustCompile(`(?i)\blimit\s+\d+\s*$`).MatchString(trimmed) {
 		suffix = ""
 	}
-	wrapped := trimmed + suffix
+	// Expose `spans` as the full retention window (hot + frozen), not just the hot table.
+	now := time.Now().UnixMilli()
+	src := s.rawSource(now-int64(s.cfg.RetentionDays)*dayMs, now)
+	if src == "spans" {
+		src = "(SELECT * FROM main.spans)" // avoid a circular CTE reference
+	}
+	wrapped := fmt.Sprintf("WITH spans AS %s %s%s", src, trimmed, suffix)
 	probe, err := s.db.Query(wrapped)
 	if err != nil {
 		return nil, err
@@ -466,14 +644,82 @@ func (s *Store) runReadOnlySQL(query string) (map[string]any, error) {
 func (s *Store) forceFreeze() string {
 	s.flush()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.currentDay // spike: no cold tier; retention handled by the sweeper
+	day := s.currentDay
+	s.mu.Unlock()
+	s.freezeDay(day)
+	return day
+}
+
+// freezeDay extracts a local day's hot spans into a per-day SQLite file, ships it to the frozen
+// store (+ a small rollups snapshot), then deletes those rows from the hot table.
+func (s *Store) freezeDay(day string) {
+	startNs, endNs := dayBoundsNs(day)
+	if startNs == 0 {
+		return
+	}
+	var cnt int64
+	s.db.QueryRow(fmt.Sprintf("SELECT count(*) FROM main.spans WHERE start_ns>=%d AND start_ns<%d", startNs, endNs)).Scan(&cnt)
+	if cnt == 0 {
+		return
+	}
+	tmp := filepath.Join(s.cfg.DataDir, "freeze-"+attachSchema(day)+".sqlite")
+	os.Remove(tmp)
+	if _, err := s.db.Exec(fmt.Sprintf("ATTACH DATABASE %s AS fz", q(tmp))); err != nil {
+		fmt.Fprintln(os.Stderr, "freeze attach:", err)
+		return
+	}
+	_, err := s.db.Exec(fmt.Sprintf("CREATE TABLE fz.spans AS SELECT * FROM main.spans WHERE start_ns>=%d AND start_ns<%d", startNs, endNs))
+	s.db.Exec("DETACH fz")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "freeze copy:", err)
+		os.Remove(tmp)
+		return
+	}
+	if err := s.frozen.PutDayFile(day, tmp); err != nil {
+		fmt.Fprintln(os.Stderr, "freeze put:", err)
+		os.Remove(tmp)
+		return
+	}
+	os.Remove(tmp) // no-op for local (moved); removes the temp for s3 (uploaded)
+	if snap, err := json.Marshal(s.snapshotDayRollups(startNs/1e6, endNs/1e6)); err == nil {
+		s.frozen.PutRollups(day, snap)
+	}
+	s.db.Exec(fmt.Sprintf("DELETE FROM main.spans WHERE start_ns>=%d AND start_ns<%d", startNs, endNs))
+	s.db.Exec("PRAGMA incremental_vacuum")
+	s.fmu.Lock()
+	s.frozenDays[day] = true
+	s.fmu.Unlock()
+}
+
+func (s *Store) snapshotDayRollups(startMs, endMs int64) []frozenRollup {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	var out []frozenRollup
+	for k, a := range s.rollups {
+		if k.Hour >= startMs && k.Hour < endMs {
+			hist := make([]int, bucketCount)
+			copy(hist, a.Hist)
+			out = append(out, frozenRollup{Hour: k.Hour, Service: k.Service, Name: k.Name, SpanType: k.SpanType,
+				Dependency: k.Dependency, IsTx: k.IsTx, N: a.N, Errors: a.Errors, SumDurNs: a.SumDurNs, Hist: hist})
+		}
+	}
+	return out
 }
 
 func (s *Store) maintenance() {
+	// Roll over: freeze any local day that is fully in the past and still sitting in hot.
+	yesterday := dayOf(time.Now().UnixMilli() - dayMs)
+	s.fmu.Lock()
+	needFreeze := !s.frozenDays[yesterday] && yesterday != s.currentDay
+	s.fmu.Unlock()
+	if needFreeze {
+		s.freezeDay(yesterday)
+	}
+
 	cutoffMs := time.Now().UnixMilli() - int64(s.cfg.RetentionDays)*86400000
+	cutoffDay := dayOf(cutoffMs)
 	s.db.Exec(fmt.Sprintf("DELETE FROM spans WHERE start_ns < %d", cutoffMs*1000000))
-	s.db.Exec("PRAGMA incremental_vacuum") // return freed pages to the OS
+	s.db.Exec("PRAGMA incremental_vacuum")
 	s.rmu.Lock()
 	for k := range s.rollups {
 		if k.Hour < cutoffMs {
@@ -481,4 +727,31 @@ func (s *Store) maintenance() {
 		}
 	}
 	s.rmu.Unlock()
+
+	// Evict idle attached frozen days; drop frozen days past retention.
+	s.fmu.Lock()
+	now := time.Now().UnixMilli()
+	for day, last := range s.attached {
+		if now-last > int64(s.cfg.ColdIdleMs) {
+			s.db.Exec("DETACH " + attachSchema(day))
+			delete(s.attached, day)
+		}
+	}
+	var drop []string
+	for day := range s.frozenDays {
+		if day < cutoffDay {
+			drop = append(drop, day)
+		}
+	}
+	s.fmu.Unlock()
+	for _, day := range drop {
+		s.frozen.Drop(day)
+		s.fmu.Lock()
+		if _, ok := s.attached[day]; ok {
+			s.db.Exec("DETACH " + attachSchema(day))
+			delete(s.attached, day)
+		}
+		delete(s.frozenDays, day)
+		s.fmu.Unlock()
+	}
 }
