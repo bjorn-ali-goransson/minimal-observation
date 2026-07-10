@@ -9,29 +9,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: sqlite-server/go.sum
 
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      # Build first: @mo/server and @mo/ui typecheck against the compiled dist of
-      # @mo/shared and @mo/tracing, so the libs must exist before typecheck runs.
-      - name: Build
+      - name: Build (UI + tracing + Go server)
         run: pnpm build
 
-      - name: Typecheck
+      - name: Typecheck (UI + tracing)
         run: pnpm typecheck
+
+      - name: go vet
+        run: cd sqlite-server && CGO_ENABLED=0 go vet ./...
 
       - name: Install Playwright browser
         run: pnpm --filter @mo/e2e exec playwright install --with-deps chromium
 
-      - name: E2E (hermetic — boots app + mock Anthropic, no external services)
+      # Hermetic: Playwright boots the Go/SQLite server (local frozen tier) + a mock Anthropic,
+      # then runs smoke + agent + cold-tier specs. No external services.
+      - name: E2E
         run: pnpm --filter @mo/e2e test
 
       - name: Upload Playwright report
@@ -44,40 +49,3 @@ jobs:
             e2e/test-results
           retention-days: 7
           if-no-files-found: ignore
-
-  # Lightweight Go+SQLite server: build it (pure Go, no CGO), boot it, and run the same
-  # UI smoke suite against it to guarantee parity with the DuckDB server.
-  sqlite-e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache-dependency-path: sqlite-server/go.sum
-
-      - name: Install JS deps
-        run: pnpm install --frozen-lockfile
-      - name: Build UI
-        run: pnpm --filter @mo/ui build
-      - name: Build SQLite server (pure Go)
-        run: cd sqlite-server && CGO_ENABLED=0 go build -o moserver_sqlite .
-      - name: Install Playwright browser
-        run: pnpm --filter @mo/e2e exec playwright install --with-deps chromium
-
-      - name: Boot mock Anthropic + SQLite server
-        run: |
-          MOCK_ANTHROPIC_PORT=4390 nohup node e2e/mocks/anthropic.mjs >/tmp/mock.log 2>&1 &
-          MO_DATA_DIR="$RUNNER_TEMP/mo-sq" MO_PORT=4318 MO_API_KEY=dev-secret-key \
-            MO_UI_DIR="$PWD/packages/ui/dist" \
-            ANTHROPIC_API_KEY=test-key ANTHROPIC_BASE_URL=http://localhost:4390 MO_AGENT_MODEL=mock-model \
-            nohup ./sqlite-server/moserver_sqlite >/tmp/sq.log 2>&1 &
-          for i in $(seq 1 40); do curl -sf http://localhost:4318/api/health && curl -sf http://localhost:4390/health && break; sleep 0.5; done
-
-      - name: E2E against SQLite server (smoke + agent, mocked LLM)
-        run: MO_BASE_URL=http://localhost:4318 MO_AGENT_E2E=1 pnpm --filter @mo/e2e test smoke.spec.ts agent.spec.ts

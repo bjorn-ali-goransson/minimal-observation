@@ -1,7 +1,5 @@
-# Full local stack: the APM server + a MinIO that mocks S3 for the cold tier.
-# `docker compose up` gives you a feather-light APM at http://localhost:4318 with a
-# real S3-backed cold tier — no cloud account needed. E2E: `pnpm e2e` (host) or the
-# `e2e` profile below.
+# Full local stack: the Go/SQLite APM server + a MinIO that backs the S3 frozen tier.
+# `docker compose up` → http://localhost:4318 (key: dev-secret-key). Old days freeze to MinIO.
 
 services:
   minio:
@@ -19,7 +17,6 @@ services:
       timeout: 2s
       retries: 20
 
-  # Creates the bucket once MinIO is healthy, then exits.
   createbucket:
     image: minio/mc:latest
     depends_on:
