@@ -91,7 +91,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/meta", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"currentDay": s.store.currentDay, "retentionDays": s.cfg.RetentionDays,
-			"coldKind": s.cfg.ColdKind, "agentEnabled": false, "impl": "go",
+			"coldKind": s.cfg.ColdKind, "agentEnabled": s.cfg.AgentEnabled, "impl": "go-sqlite",
 		})
 	})
 
@@ -302,7 +302,27 @@ func (s *Server) routes() http.Handler {
 	})
 
 	mux.HandleFunc("POST /api/agent", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 503, map[string]any{"error": "AI agent not implemented in the Go port"})
+		var body struct {
+			Question string `json:"question"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if strings.TrimSpace(body.Question) == "" {
+			writeJSON(w, 400, map[string]any{"error": "question required"})
+			return
+		}
+		if !s.cfg.AgentEnabled {
+			writeJSON(w, 503, map[string]any{"error": "AI agent disabled: set ANTHROPIC_API_KEY"})
+			return
+		}
+		answer, steps, err := investigate(s.cfg, s.store, body.Question)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		if steps == nil {
+			steps = []AgentStep{}
+		}
+		writeJSON(w, 200, map[string]any{"answer": answer, "steps": steps})
 	})
 
 	mux.HandleFunc("POST /v1/traces", func(w http.ResponseWriter, r *http.Request) {

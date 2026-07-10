@@ -18,6 +18,9 @@ type Config struct {
 	ColdIdleMs    int
 	UIDir         string
 	AgentEnabled  bool
+	AgentAPIKey   string
+	AgentModel    string
+	AgentBaseURL  string // override the Anthropic API base URL (e.g. a local mock)
 }
 
 func env(k, d string) string {
@@ -48,5 +51,8 @@ func loadConfig() Config {
 		ColdIdleMs:    envi("MO_COLD_IDLE_MS", 3600000),
 		UIDir:         env("MO_UI_DIR", ""),
 		AgentEnabled:  os.Getenv("ANTHROPIC_API_KEY") != "",
+		AgentAPIKey:   os.Getenv("ANTHROPIC_API_KEY"),
+		AgentModel:    env("MO_AGENT_MODEL", "claude-opus-4-8"),
+		AgentBaseURL:  env("ANTHROPIC_BASE_URL", env("MO_AGENT_BASE_URL", "https://api.anthropic.com")),
 	}
 }

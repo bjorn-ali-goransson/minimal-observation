@@ -47,8 +47,11 @@ server as its own job (`sqlite-e2e`).
 - **No Parquet/S3 cold tier** — by design (see flat-RAM above); a `DELETE`/vacuum retention
   sweep is enough. S3 archival for durability is an optional follow-up, not needed for the
   stated goals (loss is acceptable).
-- **Agent** (`/api/agent`) returns 503 here; the DuckDB TypeScript server carries the AI
-  investigator (tracked in `BACKLOG.md`).
+
+The **AI investigator is supported** here: `/api/agent` runs the same Anthropic Messages API
+tool-use loop as the TypeScript server, implemented in Go over raw `net/http` (no SDK), driving
+the same query tools (`list_services`, `get_endpoint`, `list_traces`, `get_trace`, `run_sql`, …).
+Enable it with `ANTHROPIC_API_KEY`. CI exercises it against the mock LLM (`agent.spec`).
 
 ## Design notes
 

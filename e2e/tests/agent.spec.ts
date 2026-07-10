@@ -8,7 +8,9 @@ import { test, expect, type Page } from '@playwright/test';
  */
 const KEY = process.env.MO_API_KEY || 'dev-secret-key';
 
-test.skip(!!process.env.MO_BASE_URL, 'agent mock only wired in the self-managed e2e run');
+// Runs whenever a mock-wired server is the target (self-managed run sets this; the SQLite
+// CI job sets it too). Off by default so plain external runs don't hit a real API.
+test.skip(process.env.MO_AGENT_E2E !== '1', 'set MO_AGENT_E2E=1 with the Anthropic mock wired');
 
 async function connect(page: Page) {
   await page.addInitScript((k) => localStorage.setItem('mo.apikey', k), KEY);
