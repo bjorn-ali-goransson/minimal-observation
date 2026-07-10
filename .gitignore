@@ -15,3 +15,6 @@ coverage/
 # SQLite spike
 sqlite-server/moserver_sqlite
 sqlite-server/data/
+
+freeze-*.sqlite
+cold-cache/

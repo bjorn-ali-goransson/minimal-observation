@@ -21,8 +21,11 @@ const baseURL = process.env.MO_BASE_URL || `http://localhost:${APP_PORT}`;
 const KEY = process.env.MO_API_KEY || 'dev-secret-key';
 const dataDir = '/tmp/mo-e2e-data';
 
-// Self-managed run wires the Anthropic mock, so let the agent spec run against it.
-if (!external) process.env.MO_AGENT_E2E = '1';
+// Self-managed run wires the Anthropic mock and a local frozen tier, so run the agent + cold specs.
+if (!external) {
+  process.env.MO_AGENT_E2E = '1';
+  process.env.MO_TEST_COLD = '1';
+}
 
 export default defineConfig({
   testDir: './tests',
@@ -50,14 +53,13 @@ export default defineConfig({
           timeout: 20_000,
         },
         {
-          command: `sh -c "rm -rf ${dataDir} && node dist/index.js"`,
-          cwd: resolve(repo, 'packages/server'),
+          command: `sh -c "rm -rf ${dataDir} && ./moserver_sqlite"`,
+          cwd: resolve(repo, 'sqlite-server'),
           env: {
             MO_PORT: String(APP_PORT),
             MO_API_KEY: KEY,
             MO_DATA_DIR: dataDir,
             MO_COLD_KIND: 'local',
-            MO_LOG_LEVEL: 'warn',
             MO_UI_DIR: resolve(repo, 'packages/ui/dist'),
             // Agent enabled, pointed at the local mock — no external Anthropic call.
             ANTHROPIC_API_KEY: 'test-key',

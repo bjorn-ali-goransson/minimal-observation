@@ -14,8 +14,21 @@ export async function api<T = any>(path: string, opts: RequestInit = {}): Promis
   });
   if (res.status === 401) throw new ApiError('unauthorized', 401);
   if (!res.ok) throw new ApiError((await res.text()) || res.statusText, res.status);
+  const cold = res.headers.get('X-MO-Cold');
+  if (cold) notifyCold(cold.split(',').filter(Boolean));
   const ct = res.headers.get('content-type') || '';
   return (ct.includes('json') ? await res.json() : await res.text()) as T;
+}
+
+// Pub/sub for "this response drew on frozen (cold/S3) storage" — used by the cold indicator.
+type ColdListener = (days: string[]) => void;
+const coldListeners = new Set<ColdListener>();
+export function onCold(fn: ColdListener): () => void {
+  coldListeners.add(fn);
+  return () => coldListeners.delete(fn);
+}
+function notifyCold(days: string[]) {
+  coldListeners.forEach((f) => f(days));
 }
 
 export class ApiError extends Error {

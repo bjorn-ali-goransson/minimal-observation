@@ -5,64 +5,72 @@ Guidance for Claude Code (and humans) working in this repo.
 ## What this is
 
 **Minimal Observation** — a feather-light distributed-tracing APM (a tiny Elastic-APM/Kibana).
-The hard, sprawling part (instrumentation) is delegated to **OpenTelemetry**; what we build is the
-**backend + storage + UI + AI investigator**. Everything is TypeScript except the storage engine
-(DuckDB, embedded).
+Instrumentation is delegated to **OpenTelemetry**; we build the **server + storage + UI + AI
+investigator**. The server is a single **pure-Go** binary using **embedded SQLite** for raw spans
+and **in-process histogram rollups** for overviews. (A TypeScript/DuckDB server existed earlier and
+was removed in favour of this lighter one; a Go+DuckDB benchmark lives on branch
+`claude/go-server-rewrite`.)
 
 Data model (derived from OTel spans, never re-derived downstream):
 - **service** = OTel `service.name`
 - **transaction** = a root/entry span (`kind = SERVER|CONSUMER`) — `is_transaction`
 - **span / dependency** = a child span (`kind = CLIENT|PRODUCER` → a dependency; `INTERNAL` → custom timespan)
 
-## Architecture (one server process)
+## Architecture (one Go process)
 
 ```
 OTel SDK (client)  ──OTLP/HTTP JSON + x-api-key──▶  POST /v1/traces
                                                      │ micro-batch buffer (RAM)
                                                      ▼ flush every MO_FLUSH_MAX_MS / _ROWS
-   HOT: today.  →  WARM: warm.duckdb (spans table)  ──00:00 local──▶  COLD: day=YYYY-MM-DD/*.parquet
-                     rollups.duckdb (hourly histograms, all days)      (local dir OR s3/MinIO via httpfs)
-   Query API + React UI + AI agent all read via one DuckStore.
+   HOT: spans.sqlite (recent, unfrozen)   ── day rollover / admin ──▶  FROZEN: day=YYYY-MM-DD/
+   ROLLUPS: in-memory histograms (all days, tiny)                        spans.sqlite + rollups.json
+   Query API + React UI + AI agent all read via one Store.               (local dir OR s3/MinIO)
 ```
 
-Tiering rationale (see the design in git history / README):
-- **Rollups** (per-hour, per-(service,name,span_type,dependency) latency **histograms**) make multi-day
-  overview screens cheap and keep them working after raw data goes cold. Histograms are *mergeable*, so
-  "p95 over 7 days" needs no raw spans. Exact percentiles for a single endpoint come from raw hot data.
-- **Cold** is day-partitioned Parquet. Overviews read rollups; drilling into an old trace **unpacks** that
-  day's Parquet into a temp table with a **sliding idle eviction** (`MO_COLD_IDLE_MS`).
-- **Retention**: S3 lifecycle rule (cold) + a `DELETE` on rollups. Local cold is dir-deleted by the sweeper.
+Why this shape:
+- **In-memory rollups** (per-hour histograms per (service,name,span_type,dependency)) serve every
+  overview/chart/percentile screen with no query engine. They're mergeable, so multi-day percentiles
+  are cheap and survive frozen days. Endpoint-detail percentiles are computed **exactly** in Go.
+- **Flat RAM**: SQLite reads through a small page cache (`cache_size≈2MB`), so RSS stays ~flat as data
+  grows. Idle ≈ 9 MB, loaded ≈ 50–80 MB regardless of row count.
+- **Frozen tier** ships a finished day's hot spans to a per-day SQLite file (+ a small `rollups.json`
+  snapshot) on the frozen store — local dir or **S3/MinIO** (`minio-go`) — then deletes them from hot.
+  Reads `UNION` hot with any frozen days in range, attaching each day's file (downloaded from S3 on
+  first touch) and evicting it after `MO_COLD_IDLE_MS` idle. On restart, overviews reload from the
+  rollup snapshots; drill-in lazily re-downloads the raw file. The UI shows a **cold-load badge**
+  (`/api/frozen` + the `X-MO-Cold` response header).
+- **Retention**: hot `DELETE` sweep + `incremental_vacuum`; frozen days past retention are dropped.
+- **Loss is acceptable** by design (`synchronous=OFF`): up to one flush interval on a crash. Do not
+  add durability/WAL sync.
 
 ## Layout
 
-- `packages/shared` — `@mo/shared`: `Span` type, OTLP→Span decoder, latency-histogram math. No deps.
-- `packages/server` — `@mo/server`: Fastify (ingest + query + agent + static UI). `store/DuckStore.ts` is
-  the tiered store; `aggregate.ts` turns rollup rows into view payloads; `agent.ts` is the tool-use loop.
-- `packages/tracing` — `@mo/tracing`: one-call OTel setup (auto-instrumentation, header enrichment, SQL
-  row-count hook), plus `withSpan` / `startTransaction` / `recordDbRows`.
-- `packages/ui` — `@mo/ui`: React + Vite + uPlot. Tiny hash router. Views: Services, Service, Endpoint,
-  Trace (waterfall), Dependencies, Dependency, Query (custom SQL + chart), Agent.
-- `services/sample` — `@mo/sample`: a real instrumented Express app (gateway→backend) that emits traces.
-- `e2e` — Playwright, **hermetic**: no external services. The config boots the app (local cold tier)
-  and a **mock Anthropic** server (`mocks/anthropic.mjs`); the agent's `baseURL` is pointed at it so the
-  real tool loop runs offline. `smoke.spec.ts` (UI), `agent.spec.ts` (mocked LLM), `cold.spec.ts`
-  (freeze; gated by `MO_TEST_COLD=1`). Set `MO_BASE_URL` to test an external stack (compose + MinIO-as-S3).
+- `sqlite-server/` — **the server** (Go, package `main`): `store.go` (SQLite + rollups + frozen tier),
+  `frozen.go` (local/S3 frozen store), `otlp.go` (OTLP→Span decode + derivation), `histogram.go`,
+  `aggregate.go`, `agent.go` (Anthropic tool-use loop over raw net/http), `server.go` (HTTP + auth +
+  static UI), `config.go`, `main.go`.
+- `packages/ui` — `@mo/ui`: React + Vite + uPlot. Views: Services, Service, Endpoint, Trace
+  (waterfall), Dependencies, Dependency, Query (custom SQL + chart), Agent. Cold badge in the top bar.
+- `packages/tracing` — `@mo/tracing`: one-call OTel setup (auto-instrumentation, header enrichment,
+  SQL row-count hook), plus `withSpan` / `startTransaction` / `recordDbRows`.
+- `services/sample` — `@mo/sample`: a real instrumented Express app (gateway→backend).
+- `scripts/seed.mjs` — standalone OTLP load generator (`pnpm seed`).
+- `e2e` — Playwright, hermetic: boots the Go server (local frozen tier) + a mock Anthropic server;
+  `smoke.spec` (UI), `agent.spec` (mocked LLM), `cold.spec` (freeze + read-back).
 
 ## Commands
 
 ```bash
 pnpm install
-pnpm --filter @mo/shared build && pnpm --filter @mo/tracing build   # build libs first (server/ui import dist)
-pnpm dev:server        # tsx watch — ingest+query+UI on :4318 (needs @mo/shared built)
-pnpm dev:ui            # Vite on :5173, proxies /api and /v1 to :4318
-pnpm build             # build all packages (shared, tracing, server, ui)
-pnpm start             # run compiled server (node packages/server/dist/index.js)
-pnpm seed              # POST ~400 synthetic OTLP traces to the running server
-pnpm sample            # run the instrumented Express sample (real OTel spans)
-pnpm typecheck         # tsc across the workspace
-pnpm e2e               # build, then hermetic Playwright run (boots app + mock Anthropic, no network)
-                       # against an external stack instead:  MO_BASE_URL=… pnpm --filter @mo/e2e test
-docker compose up      # full stack incl. MinIO-as-S3 cold tier
+pnpm build              # build UI + tracing + the Go server (sqlite-server/moserver_sqlite)
+pnpm start              # run the built server on :4318 (serves the built UI)
+pnpm dev:server         # go run the server (needs Go toolchain)
+pnpm dev:ui             # Vite on :5173, proxies /api and /v1 to :4318
+pnpm seed               # POST ~400 synthetic OTLP traces to the running server
+pnpm sample             # run the instrumented Express sample (real OTel spans)
+pnpm typecheck          # tsc across UI + tracing
+pnpm e2e                # build, then hermetic Playwright run (Go server + mock Anthropic, no network)
+docker compose up       # full stack incl. MinIO-backed S3 frozen tier
 ```
 
 Auth: every `/api/*` and `/v1/*` call needs the API key via `x-api-key`, `Authorization: ApiKey|Bearer`,
@@ -70,13 +78,12 @@ or (browser downloads only) `?k=`. Default dev key `dev-secret-key`.
 
 ## Conventions / gotchas
 
-- **DuckDB**: single writer — keep ingest + query in one process. Appender needs `appendNull()` for nulls.
-  Counts return as `bigint` (down-converted in `duck.ts#all`). **Never `SELECT` a raw epoch-ns BIGINT**
-  (exceeds `Number.MAX_SAFE_INTEGER`) — select `col/1e6` as ms. `rows` is a reserved alias — don't use it.
-- **OTLP JSON only** at `/v1/traces` (configure the OTel exporter as `exporter-trace-otlp-http`, not proto).
-- **Loss is acceptable** by design: up to one flush interval, plus today-so-far on a crash (today only
-  reaches cold at midnight). Do not add durability/WAL/sync — it's an explicit non-goal.
-- The `store/*.sql` strings are inlined and value-escaped via `q()`. Custom SQL (`/api/query`) is
-  `SELECT`/`WITH`-only, keyword-blocklisted, and wrapped so `spans` = the retention-window relation.
-- Build order matters: `@mo/shared` (and `@mo/tracing`) must be built before `@mo/server`/`@mo/ui` typecheck,
-  because they import from `dist`.
+- **Go 1.24, CGO not required** — `modernc.org/sqlite` is pure Go; build with `CGO_ENABLED=0`.
+- **SQLite single writer**: `MaxOpenConns(1)`; ingest micro-batches insert in one tx. Never `SELECT`
+  raw epoch-ns as a JS number downstream — the API selects `col/1e6` as ms.
+- **Rollups live in RAM** and are rebuilt from hot spans + frozen `rollups.json` snapshots on startup.
+- **Custom SQL** (`/api/query`) is `SELECT`/`WITH`-only, keyword-blocklisted (word-boundary), wrapped so
+  `spans` = the full retention window (hot ∪ frozen). Standard SQL only — no DuckDB-specific functions.
+- **OTLP JSON only** at `/v1/traces` (configure the OTel exporter as `exporter-trace-otlp-http`).
+- The UI is shared; keep query samples portable. `@mo/tracing` and the sample are TS and independent of
+  the server.

@@ -44,9 +44,11 @@ server as its own job (`sqlite-e2e`).
   trace_id, dependency) are fast; a full-table `GROUP BY` over millions of rows is slower than
   DuckDB. The hot overview path never touches raw — it reads in-memory rollups.
 - **Overview percentiles are histogram-approximate** (same as DuckDB's overview path).
-- **No Parquet/S3 cold tier** — by design (see flat-RAM above); a `DELETE`/vacuum retention
-  sweep is enough. S3 archival for durability is an optional follow-up, not needed for the
-  stated goals (loss is acceptable).
+- **Frozen tier (local or S3/MinIO)** — finished days freeze to a per-day SQLite file + a small
+  `rollups.json` snapshot on the frozen store; hot rows are then deleted. Reads UNION hot with any
+  frozen days in range (downloaded from S3 on first touch via `minio-go`, evicted after
+  `MO_COLD_IDLE_MS` idle). Overviews reload from snapshots on restart; the UI shows a cold-load
+  badge. Note this is about durability/offload, not memory — RSS is flat regardless (above).
 
 The **AI investigator is supported** here: `/api/agent` runs the same Anthropic Messages API
 tool-use loop as the TypeScript server, implemented in Go over raw `net/http` (no SDK), driving
