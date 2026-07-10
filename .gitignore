@@ -11,3 +11,7 @@ playwright-report/
 test-results/
 .pnpm-store/
 coverage/
+
+# SQLite spike
+sqlite-server/moserver_sqlite
+sqlite-server/data/
