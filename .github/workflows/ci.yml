@@ -70,12 +70,14 @@ jobs:
       - name: Install Playwright browser
         run: pnpm --filter @mo/e2e exec playwright install --with-deps chromium
 
-      - name: Boot SQLite server
+      - name: Boot mock Anthropic + SQLite server
         run: |
+          MOCK_ANTHROPIC_PORT=4390 nohup node e2e/mocks/anthropic.mjs >/tmp/mock.log 2>&1 &
           MO_DATA_DIR="$RUNNER_TEMP/mo-sq" MO_PORT=4318 MO_API_KEY=dev-secret-key \
             MO_UI_DIR="$PWD/packages/ui/dist" \
+            ANTHROPIC_API_KEY=test-key ANTHROPIC_BASE_URL=http://localhost:4390 MO_AGENT_MODEL=mock-model \
             nohup ./sqlite-server/moserver_sqlite >/tmp/sq.log 2>&1 &
-          for i in $(seq 1 40); do curl -sf http://localhost:4318/api/health && break; sleep 0.5; done
+          for i in $(seq 1 40); do curl -sf http://localhost:4318/api/health && curl -sf http://localhost:4390/health && break; sleep 0.5; done
 
-      - name: Smoke suite against SQLite server
-        run: MO_BASE_URL=http://localhost:4318 pnpm --filter @mo/e2e test smoke.spec.ts
+      - name: E2E against SQLite server (smoke + agent, mocked LLM)
+        run: MO_BASE_URL=http://localhost:4318 MO_AGENT_E2E=1 pnpm --filter @mo/e2e test smoke.spec.ts agent.spec.ts

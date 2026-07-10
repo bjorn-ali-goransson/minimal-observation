@@ -71,12 +71,13 @@ Same OTLP ingest, same query API, same React UI — pick your storage engine by 
 | Distribution | node + node_modules | one 15 MB pure-Go binary |
 | Ad-hoc SQL | full DuckDB (columnar, `quantile_cont`, Parquet) | standard SQL only |
 | Cold tier | Parquet, local or S3/MinIO | none needed — flat RAM, `DELETE` retention |
-| AI investigator | ✅ | ✗ (503) |
+| AI investigator | ✅ | ✅ |
 
-The **TypeScript/DuckDB** server is the feature-complete reference (agent, S3 cold tier,
-columnar analytics). The **Go/SQLite** server is the lightweight option: its page cache keeps
-RSS flat regardless of retained volume, so it drops the tiering entirely. Both pass the same UI
-smoke suite in CI. Details + the full comparison: [`sqlite-server/README.md`](./sqlite-server/README.md).
+The **TypeScript/DuckDB** server is the reference (S3 cold tier, columnar analytics, arbitrary
+DuckDB SQL). The **Go/SQLite** server is the lightweight option at feature parity for the core
+product — including the AI investigator — its page cache keeps RSS flat regardless of retained
+volume, so it drops the tiering entirely. Both pass the same UI + agent e2e in CI. Details + the
+full comparison: [`sqlite-server/README.md`](./sqlite-server/README.md).
 
 ## Configuration
 
