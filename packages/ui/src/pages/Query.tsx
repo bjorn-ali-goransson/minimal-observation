@@ -2,10 +2,12 @@ import { useState } from 'react';
 import { api } from '../api.js';
 import { Chart } from '../components/Chart.js';
 
+// Portable across both storage backends (DuckDB and the lightweight SQLite variant) —
+// no engine-specific functions (e.g. quantile_cont), so the query view works on either.
 const SAMPLES: Record<string, string> = {
-  'Slowest DB statements': `SELECT db_statement, count(*) AS calls, round(avg(dur_ns)/1e6,1) AS avg_ms,\n       round(quantile_cont(dur_ns,0.95)/1e6,1) AS p95_ms, sum(db_rows) AS total_rows\nFROM spans WHERE span_type = 'db'\nGROUP BY 1 ORDER BY p95_ms DESC`,
-  'Requests per hour': `SELECT (start_ns // 3600000000000) * 3600 AS t, count(*) AS requests\nFROM spans WHERE is_transaction GROUP BY 1 ORDER BY 1`,
-  'Error rate by service': `SELECT service, round(100.0*sum(status='ERROR')/count(*),2) AS error_pct, count(*) AS n\nFROM spans WHERE is_transaction GROUP BY 1 ORDER BY error_pct DESC`,
+  'Slowest DB statements': `SELECT db_statement, count(*) AS calls, round(avg(dur_ns)/1e6,1) AS avg_ms,\n       round(max(dur_ns)/1e6,1) AS max_ms, sum(db_rows) AS total_rows\nFROM spans WHERE span_type = 'db'\nGROUP BY 1 ORDER BY calls DESC`,
+  'Requests per hour': `SELECT CAST(start_ns/3600000000000 AS BIGINT)*3600 AS t, count(*) AS requests\nFROM spans WHERE is_transaction GROUP BY 1 ORDER BY 1`,
+  'Error rate by service': `SELECT service, round(100.0*sum(CASE WHEN status='ERROR' THEN 1 ELSE 0 END)/count(*),2) AS error_pct, count(*) AS n\nFROM spans WHERE is_transaction GROUP BY 1 ORDER BY error_pct DESC`,
   'Rows returned distribution': `SELECT db_rows, count(*) AS n FROM spans\nWHERE span_type='db' AND db_rows >= 0 GROUP BY 1 ORDER BY 1`,
 };
 

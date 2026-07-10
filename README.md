@@ -61,6 +61,23 @@ rule (cold) plus a rollup `DELETE`. Anything unflushed on a crash is lost — an
 
 See [`CLAUDE.md`](./CLAUDE.md) for architecture details, layout, and gotchas.
 
+## Two server implementations
+
+Same OTLP ingest, same query API, same React UI — pick your storage engine by footprint:
+
+| | `packages/server` (TS + DuckDB) | [`sqlite-server`](./sqlite-server) (Go + SQLite) |
+|---|---|---|
+| RSS idle / loaded (17.4k spans) | 115 / 232 MB | **9 / 54 MB** |
+| Distribution | node + node_modules | one 15 MB pure-Go binary |
+| Ad-hoc SQL | full DuckDB (columnar, `quantile_cont`, Parquet) | standard SQL only |
+| Cold tier | Parquet, local or S3/MinIO | none needed — flat RAM, `DELETE` retention |
+| AI investigator | ✅ | ✗ (503) |
+
+The **TypeScript/DuckDB** server is the feature-complete reference (agent, S3 cold tier,
+columnar analytics). The **Go/SQLite** server is the lightweight option: its page cache keeps
+RSS flat regardless of retained volume, so it drops the tiering entirely. Both pass the same UI
+smoke suite in CI. Details + the full comparison: [`sqlite-server/README.md`](./sqlite-server/README.md).
+
 ## Configuration
 
 Copy `.env.example` → `.env`. Key knobs: `MO_API_KEY`, `MO_PORT`, `MO_DATA_DIR`, `MO_RETENTION_DAYS`,

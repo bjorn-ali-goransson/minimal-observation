@@ -18,8 +18,9 @@ import (
 // rollups (mergeable histograms) for the overview/chart/percentile screens. The rollups
 // need no engine at all, so SQLite only carries the ad-hoc-SQL + retention weight.
 //
-// Spike scope: no cold tier (single retention-swept SQLite file); overview percentiles are
-// histogram-approximate, endpoint-detail percentiles are exact (computed in Go).
+// No cold tier by design: SQLite's small page cache keeps RSS flat as data grows, so a single
+// retention-swept file (DELETE + incremental vacuum) is enough. Overview percentiles are
+// histogram-approximate; endpoint-detail percentiles are exact (computed in Go).
 type Store struct {
 	cfg        Config
 	db         *sql.DB
@@ -87,8 +88,9 @@ func newStore(cfg Config) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1) // single writer; keeps SQLite simple and memory tiny
 	for _, p := range []string{
+		"PRAGMA auto_vacuum=INCREMENTAL",                    // reclaim pages after retention DELETEs (must precede table creation)
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=OFF", // loss is acceptable by design
-		"PRAGMA cache_size=-2000", // ~2MB page cache — deliberately small
+		"PRAGMA cache_size=-2000", // ~2MB page cache — deliberately small; keeps RSS flat as data grows
 		"PRAGMA temp_store=MEMORY", "PRAGMA busy_timeout=5000",
 	} {
 		if _, err := db.Exec(p); err != nil {
@@ -471,6 +473,7 @@ func (s *Store) forceFreeze() string {
 func (s *Store) maintenance() {
 	cutoffMs := time.Now().UnixMilli() - int64(s.cfg.RetentionDays)*86400000
 	s.db.Exec(fmt.Sprintf("DELETE FROM spans WHERE start_ns < %d", cutoffMs*1000000))
+	s.db.Exec("PRAGMA incremental_vacuum") // return freed pages to the OS
 	s.rmu.Lock()
 	for k := range s.rollups {
 		if k.Hour < cutoffMs {

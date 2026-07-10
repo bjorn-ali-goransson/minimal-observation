@@ -44,3 +44,38 @@ jobs:
             e2e/test-results
           retention-days: 7
           if-no-files-found: ignore
+
+  # Lightweight Go+SQLite server: build it (pure Go, no CGO), boot it, and run the same
+  # UI smoke suite against it to guarantee parity with the DuckDB server.
+  sqlite-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: sqlite-server/go.sum
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+      - name: Build UI
+        run: pnpm --filter @mo/ui build
+      - name: Build SQLite server (pure Go)
+        run: cd sqlite-server && CGO_ENABLED=0 go build -o moserver_sqlite .
+      - name: Install Playwright browser
+        run: pnpm --filter @mo/e2e exec playwright install --with-deps chromium
+
+      - name: Boot SQLite server
+        run: |
+          MO_DATA_DIR="$RUNNER_TEMP/mo-sq" MO_PORT=4318 MO_API_KEY=dev-secret-key \
+            MO_UI_DIR="$PWD/packages/ui/dist" \
+            nohup ./sqlite-server/moserver_sqlite >/tmp/sq.log 2>&1 &
+          for i in $(seq 1 40); do curl -sf http://localhost:4318/api/health && break; sleep 0.5; done
+
+      - name: Smoke suite against SQLite server
+        run: MO_BASE_URL=http://localhost:4318 pnpm --filter @mo/e2e test smoke.spec.ts
